@@ -1,0 +1,4 @@
+.claude/settings.local.json
+api.yaml
+.env
+.DS_Store
