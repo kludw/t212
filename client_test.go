@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -399,4 +401,203 @@ func TestClient_Reports(t *testing.T) {
 	reports, err := c.Reports(context.Background())
 	require.NoError(t, err)
 	require.Len(t, reports, 1)
+}
+
+// withFastWatcher swaps the watcher poll interval to d for the duration of t.
+func withFastWatcher(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := positionWatcherInterval
+	positionWatcherInterval = d
+	t.Cleanup(func() { positionWatcherInterval = prev })
+}
+
+// positionsServer returns an httptest server whose /equity/positions handler
+// returns the next JSON body from bodies, advancing one entry per call. After
+// the slice is exhausted it keeps returning the last entry.
+func positionsServer(t *testing.T, bodies []string) *httptest.Server {
+	t.Helper()
+	var idx int32
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/equity/positions", r.URL.Path)
+		i := int(atomic.AddInt32(&idx, 1)) - 1
+		if i >= len(bodies) {
+			i = len(bodies) - 1
+		}
+		fmt.Fprintln(w, bodies[i])
+	}))
+}
+
+func TestStartPositionWatcher_NilCallbacks(t *testing.T) {
+	c := newTestClient("http://unused")
+	doneCh, err := c.StartPositionWatcher(context.Background())
+	assert.ErrorIs(t, err, ErrNilPosWatcherCallbacks)
+	assert.Nil(t, doneCh)
+}
+
+func TestStartPositionWatcher_OpenCallback(t *testing.T) {
+	withFastWatcher(t, 5*time.Millisecond)
+
+	ts := positionsServer(t, []string{
+		`[{"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 1}]`,
+	})
+	defer ts.Close()
+
+	opened := make(chan *Position, 4)
+	c := newTestClient(ts.URL)
+	c.onPosOpen = func(p *Position) { opened <- p }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doneCh, err := c.StartPositionWatcher(ctx)
+	require.NoError(t, err)
+
+	select {
+	case p := <-opened:
+		require.NotNil(t, p.Instrument)
+		require.NotNil(t, p.Instrument.Ticker)
+		assert.Equal(t, "AAPL_US_EQ", *p.Instrument.Ticker)
+	case <-time.After(time.Second):
+		t.Fatal("open callback not fired")
+	}
+
+	cancel()
+	<-doneCh
+}
+
+func TestStartPositionWatcher_CloseCallback(t *testing.T) {
+	withFastWatcher(t, 5*time.Millisecond)
+
+	ts := positionsServer(t, []string{
+		`[{"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 1}]`,
+		`[]`,
+	})
+	defer ts.Close()
+
+	closed := make(chan *Position, 4)
+	c := newTestClient(ts.URL)
+	c.onPosOpen = func(*Position) {}
+	c.onPosClose = func(p *Position) { closed <- p }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doneCh, err := c.StartPositionWatcher(ctx)
+	require.NoError(t, err)
+
+	select {
+	case p := <-closed:
+		require.NotNil(t, p.Instrument)
+		require.NotNil(t, p.Instrument.Ticker)
+		assert.Equal(t, "AAPL_US_EQ", *p.Instrument.Ticker)
+	case <-time.After(time.Second):
+		t.Fatal("close callback not fired")
+	}
+
+	cancel()
+	<-doneCh
+}
+
+func TestStartPositionWatcher_NoDuplicateOpenForPersistentPosition(t *testing.T) {
+	withFastWatcher(t, 5*time.Millisecond)
+
+	ts := positionsServer(t, []string{
+		`[{"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 1}]`,
+	})
+	defer ts.Close()
+
+	var opens int32
+	c := newTestClient(ts.URL)
+	c.onPosOpen = func(*Position) { atomic.AddInt32(&opens, 1) }
+	c.onPosClose = func(*Position) {}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doneCh, err := c.StartPositionWatcher(ctx)
+	require.NoError(t, err)
+
+	// Let several poll ticks happen.
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	<-doneCh
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&opens), "open should fire exactly once for a persistent position")
+}
+
+func TestStartPositionWatcher_OnlyOpenCallback_NoPanic(t *testing.T) {
+	withFastWatcher(t, 5*time.Millisecond)
+
+	ts := positionsServer(t, []string{
+		`[{"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 1}]`,
+		`[]`,
+	})
+	defer ts.Close()
+
+	opened := make(chan struct{}, 4)
+	c := newTestClient(ts.URL)
+	c.onPosOpen = func(*Position) { opened <- struct{}{} }
+	// onPosClose intentionally nil — close detection must not panic.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doneCh, err := c.StartPositionWatcher(ctx)
+	require.NoError(t, err)
+
+	<-opened
+	time.Sleep(30 * time.Millisecond) // let close-detection run with nil cb
+	cancel()
+	<-doneCh
+}
+
+func TestStartPositionWatcher_OnlyCloseCallback_NoPanic(t *testing.T) {
+	withFastWatcher(t, 5*time.Millisecond)
+
+	ts := positionsServer(t, []string{
+		`[{"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 1}]`,
+		`[]`,
+	})
+	defer ts.Close()
+
+	closed := make(chan struct{}, 4)
+	c := newTestClient(ts.URL)
+	c.onPosClose = func(*Position) { closed <- struct{}{} }
+	// onPosOpen intentionally nil — open detection must not panic.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doneCh, err := c.StartPositionWatcher(ctx)
+	require.NoError(t, err)
+
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("close callback not fired")
+	}
+
+	cancel()
+	<-doneCh
+}
+
+func TestStartPositionWatcher_DoneClosesOnCtxCancel(t *testing.T) {
+	withFastWatcher(t, 5*time.Millisecond)
+
+	ts := positionsServer(t, []string{`[]`})
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.onPosOpen = func(*Position) {}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	doneCh, err := c.StartPositionWatcher(ctx)
+	require.NoError(t, err)
+
+	cancel()
+	select {
+	case <-doneCh:
+	case <-time.After(time.Second):
+		t.Fatal("done channel did not close after ctx cancel")
+	}
 }

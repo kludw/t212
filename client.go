@@ -2,11 +2,6 @@
 //
 // Trading 212's API is currently in beta. See https://docs.trading212.com for
 // the upstream specification.
-//
-// Construct a Client with NewClient and use its methods to call endpoints.
-// All methods take a context.Context and return either generated model types
-// (see models.gen.go) or sentinel-wrapped errors that can be inspected with
-// errors.Is — see errors.go for the available sentinels.
 package t212
 
 import (
@@ -20,23 +15,20 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// ClientOpts configures a Client.
+type PositionCallback = func(p *Position)
+
 type ClientOpts struct {
-	// Env selects the Trading 212 environment. Accepts "demo" (default) or
-	// "live" (case-insensitive). Empty defaults to demo.
-	Env string
-	// APIKeyID is the API key identifier issued by Trading 212. API keys
-	// generated in a demo account only work against the demo environment, and
-	// vice versa.
-	APIKeyID string
-	// APISecret is the API secret paired with APIKeyID.
-	APISecret string
+	// Empty defaults to demo.
+	Env             string
+	APIKeyID        string
+	APISecret       string
+	OnPositionOpen  PositionCallback
+	OnPositionClose PositionCallback
 }
 
-// Validate reports whether opts is usable. It returns one of ErrNilOpts,
-// ErrInvalidEnv, ErrEmptyAPIKeyID, or ErrEmptyAPISecret on failure.
 func (opts *ClientOpts) Validate() error {
 	if opts == nil {
 		return ErrNilOpts
@@ -60,16 +52,16 @@ func (opts *ClientOpts) Validate() error {
 	return nil
 }
 
-// Client is a Trading 212 API client. It is safe for concurrent use.
 type Client struct {
 	httpc      http.Client
 	authHeader string
 	baseURL    string
+
+	// callbacks
+	onPosOpen  PositionCallback
+	onPosClose PositionCallback
 }
 
-// NewClient validates opts and returns a configured Client. The returned
-// Client uses HTTP Basic auth derived from APIKeyID and APISecret and an HTTP
-// timeout of DefaultTimeout.
 func NewClient(opts *ClientOpts) (*Client, error) {
 	if err := opts.Validate(); err != nil {
 		return nil, err
@@ -88,6 +80,8 @@ func NewClient(opts *ClientOpts) (*Client, error) {
 		},
 		authHeader: "Basic " + creds,
 		baseURL:    baseURL,
+		onPosOpen:  opts.OnPositionOpen,
+		onPosClose: opts.OnPositionClose,
 	}, nil
 }
 
@@ -384,4 +378,72 @@ func (c *Client) Reports(ctx context.Context) ([]ReportResponse, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+var positionWatcherInterval = 3 * time.Second
+
+// StartPositionWatcher starts a goroutine that polls Positions on a fixed
+// interval and invokes the OnPositionOpen / OnPositionClose callbacks
+// registered on the Client when positions appear or disappear.
+// The returned channel can be used as an insurance
+// that the watcher loop has finished.
+//
+// Errors from the Positions endpoint during polling are dropped — the
+// watcher skips that tick and retries on the next one.
+//
+// Note: positions are keyed by ticker, so multiple independent trades of
+// the same symbol cannot be tracked individually. !TODO!
+func (c *Client) StartPositionWatcher(ctx context.Context) (<-chan struct{}, error) {
+	if c.onPosOpen == nil && c.onPosClose == nil {
+		return nil, ErrNilPosWatcherCallbacks
+	}
+
+	doneCh := make(chan struct{})
+
+	go func() {
+		defer close(doneCh)
+
+		ticker := time.NewTicker(positionWatcherInterval)
+		defer ticker.Stop()
+
+		known := make(map[string]Position)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				current, err := c.Positions(ctx, nil)
+				if err != nil {
+					// handler?
+					continue
+				}
+
+				next := make(map[string]Position, len(current))
+				for _, p := range current {
+					next[*p.Instrument.Ticker] = p
+				}
+
+				if c.onPosOpen != nil {
+					for key, p := range next {
+						if _, ok := known[key]; !ok {
+							c.onPosOpen(&p)
+						}
+					}
+				}
+
+				if c.onPosClose != nil {
+					for key, old := range known {
+						if _, ok := next[key]; !ok {
+							c.onPosClose(&old)
+						}
+					}
+				}
+
+				known = next
+			}
+		}
+	}()
+
+	return doneCh, nil
 }

@@ -16,7 +16,7 @@ ensure_repo_root() {
 
 run_tests() {
     echo "Running tests..."
-    go test -race -count=1 ./...
+    go test -race -count=25 -failfast ./...
 }
 
 ensure_go
