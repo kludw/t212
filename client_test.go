@@ -53,8 +53,7 @@ func newWatcherClient(t *testing.T, serverURL string, opts ClientOpts) *Client {
 	return c
 }
 
-//go:fix inline
-func ptr[T any](v T) *T { return new(v) }
+func ptr[T any](v T) *T { return &v }
 
 func TestClientOpts_Validate(t *testing.T) {
 	tests := []struct {
