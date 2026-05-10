@@ -200,6 +200,43 @@ func TestClient_AccountSummary_Unauthorized(t *testing.T) {
 	assert.ErrorIs(t, err, ErrUnauthorized)
 }
 
+func TestDo_EncodeError(t *testing.T) {
+	c := newTestClient("http://unused")
+	// channels cannot be JSON-encoded.
+	err := c.do(context.Background(), http.MethodPost, "/", nil, make(chan int), nil)
+	assert.ErrorIs(t, err, ErrEncode)
+}
+
+func TestClient_Positions(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/equity/positions", r.URL.Path)
+		assert.Empty(t, r.URL.RawQuery)
+		fmt.Fprintln(w, `[{"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 1}]`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	positions, err := c.Positions(context.Background(), nil)
+	require.NoError(t, err)
+	require.Len(t, positions, 1)
+	require.NotNil(t, positions[0].Instrument)
+	require.NotNil(t, positions[0].Instrument.Ticker)
+	assert.Equal(t, "AAPL_US_EQ", *positions[0].Instrument.Ticker)
+}
+
+func TestClient_Positions_TickerFilter(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "MSFT_US_EQ", r.URL.Query().Get("ticker"))
+		fmt.Fprintln(w, `[]`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	_, err := c.Positions(context.Background(), &GetPositionsParams{Ticker: ptr("MSFT_US_EQ")})
+	require.NoError(t, err)
+}
+
 func TestClient_Orders(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
@@ -333,14 +370,17 @@ func TestClient_Exchanges(t *testing.T) {
 func TestClient_HistoricalOrders(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/equity/history/orders", r.URL.Path)
-		assert.Equal(t, "50", r.URL.Query().Get("limit"))
-		assert.Equal(t, "AAPL_US_EQ", r.URL.Query().Get("ticker"))
+		q := r.URL.Query()
+		assert.Equal(t, "50", q.Get("limit"))
+		assert.Equal(t, "AAPL_US_EQ", q.Get("ticker"))
+		assert.Equal(t, "987", q.Get("cursor"))
 		fmt.Fprintln(w, `{"items": [], "nextPagePath": "/foo"}`)
 	}))
 	defer ts.Close()
 
 	c := newTestClient(ts.URL)
 	resp, err := c.HistoricalOrders(context.Background(), &Orders1Params{
+		Cursor: ptr[int64](987),
 		Limit:  ptr[int32](50),
 		Ticker: ptr("AAPL_US_EQ"),
 	})
@@ -361,6 +401,25 @@ func TestClient_Dividends(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestClient_Dividends_AllParams(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		assert.Equal(t, "42", q.Get("cursor"))
+		assert.Equal(t, "AAPL_US_EQ", q.Get("ticker"))
+		assert.Equal(t, "10", q.Get("limit"))
+		fmt.Fprintln(w, `{"items": []}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	_, err := c.Dividends(context.Background(), &DividendsParams{
+		Cursor: ptr[int64](42),
+		Ticker: ptr("AAPL_US_EQ"),
+		Limit:  ptr[int32](10),
+	})
+	require.NoError(t, err)
+}
+
 func TestClient_Transactions(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/equity/history/transactions", r.URL.Path)
@@ -371,6 +430,24 @@ func TestClient_Transactions(t *testing.T) {
 
 	c := newTestClient(ts.URL)
 	_, err := c.Transactions(context.Background(), &TransactionsParams{Limit: ptr[int32](50)})
+	require.NoError(t, err)
+}
+
+func TestClient_Transactions_CursorAndTime(t *testing.T) {
+	when := time.Date(2026, 5, 10, 12, 34, 56, 0, time.UTC)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		assert.Equal(t, "page-2", q.Get("cursor"))
+		assert.Equal(t, "2026-05-10T12:34:56Z", q.Get("time"))
+		fmt.Fprintln(w, `{"items": []}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	_, err := c.Transactions(context.Background(), &TransactionsParams{
+		Cursor: ptr("page-2"),
+		Time:   &when,
+	})
 	require.NoError(t, err)
 }
 
@@ -577,6 +654,85 @@ func TestStartPositionWatcher_OnlyCloseCallback_NoPanic(t *testing.T) {
 		t.Fatal("close callback not fired")
 	}
 
+	cancel()
+	<-doneCh
+}
+
+func TestStartPositionWatcher_InitialFetchError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.onPosOpen = func(*Position) {}
+
+	doneCh, err := c.StartPositionWatcher(context.Background())
+	assert.ErrorIs(t, err, ErrUnauthorized)
+	assert.Nil(t, doneCh)
+}
+
+func TestStartPositionWatcher_InitialRateLimitedTolerated(t *testing.T) {
+	withFastWatcher(t, 5*time.Millisecond)
+
+	var calls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// First call (synchronous initial fetch) is rate-limited; subsequent
+		// poll calls succeed.
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		fmt.Fprintln(w, `[{"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 1}]`)
+	}))
+	defer ts.Close()
+
+	opened := make(chan *Position, 4)
+	c := newTestClient(ts.URL)
+	c.onPosOpen = func(p *Position) { opened <- p }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doneCh, err := c.StartPositionWatcher(ctx)
+	require.NoError(t, err)
+
+	select {
+	case <-opened:
+	case <-time.After(time.Second):
+		t.Fatal("open callback not fired after initial rate-limited fetch")
+	}
+
+	cancel()
+	<-doneCh
+}
+
+func TestStartPositionWatcher_PollErrorsAreSwallowed(t *testing.T) {
+	withFastWatcher(t, 5*time.Millisecond)
+
+	var calls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Initial fetch succeeds with empty positions; subsequent poll calls
+		// return 500 — the watcher must swallow them and keep going, not panic.
+		if atomic.AddInt32(&calls, 1) == 1 {
+			fmt.Fprintln(w, `[]`)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.onPosOpen = func(*Position) {}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doneCh, err := c.StartPositionWatcher(ctx)
+	require.NoError(t, err)
+
+	// Let several failing ticks elapse — a panic would fail the test.
+	time.Sleep(40 * time.Millisecond)
 	cancel()
 	<-doneCh
 }

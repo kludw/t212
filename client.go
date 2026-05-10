@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -398,7 +399,22 @@ func (c *Client) StartPositionWatcher(ctx context.Context) (<-chan struct{}, err
 		return nil, ErrNilPosWatcherCallbacks
 	}
 
+	current, err := c.Positions(ctx, nil)
+	if err != nil && !errors.Is(err, ErrRateLimited) {
+		return nil, err
+	}
+
 	doneCh := make(chan struct{})
+	known := make(map[string]Position)
+
+	for _, p := range current {
+		known[*p.Instrument.Ticker] = p
+
+		if c.onPosOpen != nil {
+			c.onPosOpen(&p)
+		}
+
+	}
 
 	go func() {
 		defer close(doneCh)
@@ -406,16 +422,16 @@ func (c *Client) StartPositionWatcher(ctx context.Context) (<-chan struct{}, err
 		ticker := time.NewTicker(positionWatcherInterval)
 		defer ticker.Stop()
 
-		known := make(map[string]Position)
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
 				current, err := c.Positions(ctx, nil)
 				if err != nil {
-					// handler?
 					continue
 				}
 
