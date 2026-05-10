@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,8 +13,14 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	if err := godotenv.Load(); err != nil {
-		log.Fatalf("could not load .env: %v", err)
+		return fmt.Errorf("loading .env: %w", err)
 	}
 
 	c, err := t212.NewClient(&t212.ClientOpts{
@@ -22,7 +29,7 @@ func main() {
 		APISecret: os.Getenv("API_SECRET_KEY"),
 	})
 	if err != nil {
-		log.Fatalf("could not create client: %v", err)
+		return fmt.Errorf("creating client: %w", err)
 	}
 	defer c.Close()
 
@@ -39,10 +46,10 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("could not enqueue report: %v", err)
+		return fmt.Errorf("enqueuing report: %w", err)
 	}
 	if enq.ReportId == nil {
-		log.Fatal("report id missing in response")
+		return errors.New("report id missing in response")
 	}
 
 	report, err := c.WaitForReport(ctx, *enq.ReportId, &t212.WaitForReportOpts{
@@ -50,9 +57,10 @@ func main() {
 		MaxWait:      10 * time.Minute,
 	})
 	if err != nil {
-		log.Fatalf("waiting for report: %v", err)
+		return fmt.Errorf("waiting for report: %w", err)
 	}
 	fmt.Println("download:", report.GetDownloadLink())
+	return nil
 }
 
 func boolPtr(b bool) *bool { return &b }

@@ -11,8 +11,14 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	if err := godotenv.Load(); err != nil {
-		log.Fatalf("could not load .env: %v", err)
+		return fmt.Errorf("loading .env: %w", err)
 	}
 
 	c, err := t212.NewClient(&t212.ClientOpts{
@@ -21,13 +27,13 @@ func main() {
 		APISecret: os.Getenv("API_SECRET_KEY"),
 	})
 	if err != nil {
-		log.Fatalf("could not create client: %v", err)
+		return fmt.Errorf("creating client: %w", err)
 	}
 	defer c.Close()
 
 	summary, err := c.AccountSummary(context.Background())
 	if err != nil {
-		log.Fatalf("could not get account summary: %v", err)
+		return fmt.Errorf("account summary: %w", err)
 	}
 
 	fmt.Printf("account %d (%s): total value %.2f, %d positions known\n",
@@ -36,4 +42,5 @@ func main() {
 		summary.GetTotalValue(),
 		len(c.Snapshot()),
 	)
+	return nil
 }

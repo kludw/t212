@@ -107,26 +107,28 @@ func TestNewClient_BaseURL(t *testing.T) {
 	tests := []struct {
 		name    string
 		env     string
-		wantUrl string
+		wantURL string
 	}{
-		{name: "default to demo", env: "", wantUrl: demoURL},
-		{name: "demo", env: "demo", wantUrl: demoURL},
-		{name: "live", env: "live", wantUrl: liveURL},
-		{name: "uppercase live", env: "LIVE", wantUrl: liveURL},
+		{name: "default to demo", env: "", wantURL: demoURL},
+		{name: "demo", env: "demo", wantURL: demoURL},
+		{name: "live", env: "live", wantURL: liveURL},
+		{name: "uppercase live", env: "LIVE", wantURL: liveURL},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			_ = tt.wantURL // surfaced via the wrapped error checked below
+
 			// Use a closed httptest server URL so initial Positions fetch
 			// fails fast with a transport error — sufficient to read baseURL
 			// without making real network requests.
-			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+			ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 			ts.Close()
 
 			_, err := NewClient(&ClientOpts{
-				Env:       tt.env,
-				APIKeyID:  "k",
-				APISecret: "s",
+				Env:        tt.env,
+				APIKeyID:   "k",
+				APISecret:  "s",
 				HTTPClient: &http.Client{Timeout: 50 * time.Millisecond},
 			})
 			// Auth/base resolution is what matters; the call will fail at

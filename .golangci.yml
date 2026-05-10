@@ -15,6 +15,15 @@ linters:
     - staticcheck
     - unused
 
+  settings:
+    revive:
+      rules:
+        # Stylistic noise that does not earn its keep in this codebase.
+        - name: unused-parameter
+          disabled: true
+        - name: package-comments
+          disabled: true
+
   exclusions:
     rules:
       - path: models\.gen\.go
@@ -25,6 +34,9 @@ linters:
           - gocritic
           - misspell
           - unused
+      - path: _test\.go$
+        linters:
+          - errcheck
 
 formatters:
   enable:

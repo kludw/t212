@@ -11,8 +11,14 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	if err := godotenv.Load(); err != nil {
-		log.Fatalf("could not load .env: %v", err)
+		return fmt.Errorf("loading .env: %w", err)
 	}
 
 	c, err := t212.NewClient(&t212.ClientOpts{
@@ -21,19 +27,18 @@ func main() {
 		APISecret: os.Getenv("API_SECRET_KEY"),
 	})
 	if err != nil {
-		log.Fatalf("could not create client: %v", err)
+		return fmt.Errorf("creating client: %w", err)
 	}
 	defer c.Close()
 
-	ctx := context.Background()
-
 	count := 0
-	for o, err := range c.HistoricalOrdersIter(ctx, nil) {
+	for o, err := range c.HistoricalOrdersIter(context.Background(), nil) {
 		if err != nil {
-			log.Fatalf("page error after %d orders: %v", count, err)
+			return fmt.Errorf("page error after %d orders: %w", count, err)
 		}
 		count++
 		_ = o
 	}
 	fmt.Printf("walked %d historical orders\n", count)
+	return nil
 }

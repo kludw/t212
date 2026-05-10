@@ -17,13 +17,11 @@ func nextPageCursor(path string) (string, bool) {
 	if path == "" {
 		return "", false
 	}
-	q := path
-	if i := strings.Index(path, "?"); i >= 0 {
-		q = path[i+1:]
-	} else {
+	i := strings.Index(path, "?")
+	if i < 0 {
 		return "", false
 	}
-	values, err := url.ParseQuery(q)
+	values, err := url.ParseQuery(path[i+1:])
 	if err != nil {
 		return "", false
 	}
