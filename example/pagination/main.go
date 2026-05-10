@@ -31,16 +31,14 @@ func run() error {
 	}
 	defer c.Close()
 
-	summary, err := c.AccountSummary(context.Background())
-	if err != nil {
-		return fmt.Errorf("account summary: %w", err)
+	count := 0
+	for o, err := range c.HistoricalOrdersIter(context.Background(), nil) {
+		if err != nil {
+			return fmt.Errorf("page error after %d orders: %w", count, err)
+		}
+		count++
+		_ = o
 	}
-
-	fmt.Printf("account %d (%s): total value %.2f, %d positions known\n",
-		summary.GetID(),
-		summary.GetCurrency(),
-		summary.GetTotalValue(),
-		len(c.Snapshot()),
-	)
+	fmt.Printf("walked %d historical orders\n", count)
 	return nil
 }

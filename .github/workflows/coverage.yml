@@ -1,0 +1,30 @@
+name: Coverage
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests with coverage (excluding generated)
+        run: |
+          go test -race -coverprofile=coverage.out -covermode=atomic ./...
+          # Strip the generated file from the profile so the reported
+          # number reflects hand-written code only.
+          grep -v "models\.gen\.go" coverage.out > coverage.filtered.out
+          mv coverage.filtered.out coverage.out
+          go tool cover -func=coverage.out | tail -1
+
+      - uses: codecov/codecov-action@v4
+        with:
+          files: coverage.out
+          fail_ci_if_error: false

@@ -9,26 +9,69 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
+// PositionCallback is invoked by the position watcher when a position is
+// detected as opened or closed.
 type PositionCallback = func(p *Position)
 
+// PollErrorCallback is invoked by the position watcher when a polling tick
+// fails. The watcher continues running regardless.
+type PollErrorCallback = func(err error)
+
+// ClientOpts configures a Client. All fields except APIKeyID and APISecret
+// are optional.
 type ClientOpts struct {
-	// Empty defaults to demo.
-	Env             string
-	APIKeyID        string
-	APISecret       string
+	// Env selects which Trading 212 environment to talk to. Empty defaults to
+	// "demo". "live" routes to the production API. Ignored when BaseURL is set.
+	Env string
+
+	// BaseURL overrides Env's default URL. Useful for sandboxes, proxies, and
+	// tests. Should not include a trailing slash and should already include
+	// the API version segment (e.g. http://localhost:8080/api/v0).
+	BaseURL string
+
+	// APIKeyID and APISecret authenticate via HTTP Basic.
+	APIKeyID  string
+	APISecret string
+
+	// UserAgent overrides the default User-Agent. Empty uses defaultUserAgent.
+	UserAgent string
+
+	// HTTPClient is the underlying HTTP client used for all requests. If nil,
+	// a new http.Client is constructed with timeout RequestTimeout (or
+	// DefaultTimeout when RequestTimeout is zero).
+	HTTPClient *http.Client
+
+	// RequestTimeout overrides DefaultTimeout when HTTPClient is nil.
+	// Ignored when HTTPClient is provided.
+	RequestTimeout time.Duration
+
+	// OnPositionOpen and OnPositionClose receive the position whenever the
+	// watcher detects a transition. Both are optional — the watcher always
+	// runs so Snapshot stays current.
 	OnPositionOpen  PositionCallback
 	OnPositionClose PositionCallback
+
+	// OnPollError is invoked with any error returned by the watcher's
+	// background polling loop. The watcher does not stop on errors.
+	OnPollError PollErrorCallback
+
+	// WatcherInterval overrides DefaultWatcherInterval. Must be >= 0; zero
+	// uses the default.
+	WatcherInterval time.Duration
 }
 
+// Validate checks that ClientOpts has the minimum required fields.
 func (opts *ClientOpts) Validate() error {
 	if opts == nil {
 		return ErrNilOpts
@@ -52,37 +95,192 @@ func (opts *ClientOpts) Validate() error {
 	return nil
 }
 
+// Client is the Trading 212 API client. Construct one via NewClient. The
+// client owns a background goroutine that polls /equity/positions and
+// maintains a snapshot reachable via Snapshot. Call Close when done to stop
+// the goroutine.
 type Client struct {
-	httpc      http.Client
+	httpc      *http.Client
 	authHeader string
 	baseURL    string
+	userAgent  string
 
-	// callbacks
 	onPosOpen  PositionCallback
 	onPosClose PositionCallback
+	onPollErr  PollErrorCallback
+	interval   time.Duration
+
+	mu        sync.RWMutex
+	positions map[string]Position
+
+	cancel    context.CancelFunc
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
+// NewClient constructs a Client and starts its background position watcher.
+// It performs an initial synchronous Positions fetch so Snapshot returns
+// fresh data on return; transient rate-limit errors during that initial
+// fetch are tolerated, but other errors are returned.
 func NewClient(opts *ClientOpts) (*Client, error) {
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
 
-	baseURL := demoURL
-	if strings.ToLower(opts.Env) == "live" {
-		baseURL = liveURL
+	baseURL := opts.BaseURL
+	if baseURL == "" {
+		baseURL = demoURL
+		if strings.ToLower(opts.Env) == "live" {
+			baseURL = liveURL
+		}
+	}
+
+	httpc := opts.HTTPClient
+	if httpc == nil {
+		timeout := opts.RequestTimeout
+		if timeout == 0 {
+			timeout = DefaultTimeout
+		}
+		httpc = &http.Client{Timeout: timeout}
+	}
+
+	ua := opts.UserAgent
+	if ua == "" {
+		ua = defaultUserAgent
+	}
+
+	interval := opts.WatcherInterval
+	if interval == 0 {
+		interval = DefaultWatcherInterval
 	}
 
 	creds := base64.StdEncoding.EncodeToString([]byte(opts.APIKeyID + ":" + opts.APISecret))
 
-	return &Client{
-		httpc: http.Client{
-			Timeout: DefaultTimeout,
-		},
+	ctx, cancel := context.WithCancel(context.Background())
+
+	c := &Client{
+		httpc:      httpc,
 		authHeader: "Basic " + creds,
 		baseURL:    baseURL,
+		userAgent:  ua,
 		onPosOpen:  opts.OnPositionOpen,
 		onPosClose: opts.OnPositionClose,
-	}, nil
+		onPollErr:  opts.OnPollError,
+		interval:   interval,
+		positions:  make(map[string]Position),
+		cancel:     cancel,
+		done:       make(chan struct{}),
+	}
+
+	current, err := c.Positions(ctx, nil)
+	if err != nil && !errors.Is(err, ErrRateLimited) {
+		cancel()
+		close(c.done)
+		return nil, err
+	}
+
+	c.mu.Lock()
+	for _, p := range current {
+		if p.Instrument == nil || p.Instrument.Ticker == nil {
+			continue
+		}
+		c.positions[*p.Instrument.Ticker] = p
+	}
+	c.mu.Unlock()
+
+	if c.onPosOpen != nil {
+		for i := range current {
+			p := current[i]
+			c.onPosOpen(&p)
+		}
+	}
+
+	go c.runWatcher(ctx)
+
+	return c, nil
+}
+
+// Close stops the background position watcher and waits for it to exit.
+// Subsequent calls are no-ops. Close does not block in-flight API calls
+// initiated by other callers.
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		c.cancel()
+		<-c.done
+	})
+}
+
+// Snapshot returns the most recently observed open positions, keyed by
+// ticker. The returned slice is a copy and safe to mutate.
+func (c *Client) Snapshot() []Position {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make([]Position, 0, len(c.positions))
+	for _, p := range c.positions {
+		out = append(out, p)
+	}
+	return out
+}
+
+func (c *Client) runWatcher(ctx context.Context) {
+	defer close(c.done)
+
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if ctx.Err() != nil {
+				return
+			}
+			c.pollOnce(ctx)
+		}
+	}
+}
+
+func (c *Client) pollOnce(ctx context.Context) {
+	current, err := c.Positions(ctx, nil)
+	if err != nil {
+		if c.onPollErr != nil && ctx.Err() == nil {
+			c.onPollErr(err)
+		}
+		return
+	}
+
+	next := make(map[string]Position, len(current))
+	for _, p := range current {
+		if p.Instrument == nil || p.Instrument.Ticker == nil {
+			continue
+		}
+		next[*p.Instrument.Ticker] = p
+	}
+
+	c.mu.Lock()
+	known := c.positions
+	c.positions = next
+	c.mu.Unlock()
+
+	if c.onPosOpen != nil {
+		for key := range next {
+			if _, ok := known[key]; !ok {
+				p := next[key]
+				c.onPosOpen(&p)
+			}
+		}
+	}
+
+	if c.onPosClose != nil {
+		for key := range known {
+			if _, ok := next[key]; !ok {
+				p := known[key]
+				c.onPosClose(&p)
+			}
+		}
+	}
 }
 
 func (c *Client) do(ctx context.Context, method, path string, params url.Values, body, out any) error {
@@ -105,6 +303,7 @@ func (c *Client) do(ctx context.Context, method, path string, params url.Values,
 		return fmt.Errorf("%w: %v", ErrRequest, err)
 	}
 	req.Header.Set("Authorization", c.authHeader)
+	req.Header.Set("User-Agent", c.userAgent)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -113,7 +312,7 @@ func (c *Client) do(ctx context.Context, method, path string, params url.Values,
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrRequest, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -282,7 +481,8 @@ func (c *Client) Exchanges(ctx context.Context) ([]Exchange, error) {
 }
 
 // HistoricalOrders fetches a page of historical orders. Use params for
-// cursor-based pagination, ticker filtering, and per-page limit.
+// cursor-based pagination, ticker filtering, and per-page limit. For
+// ergonomic full-history iteration, see HistoricalOrdersIter.
 //
 // GET /api/v0/equity/history/orders (rate limit: 50 req / 1m).
 func (c *Client) HistoricalOrders(ctx context.Context, params *Orders1Params) (*PaginatedResponseHistoricalOrder, error) {
@@ -306,7 +506,8 @@ func (c *Client) HistoricalOrders(ctx context.Context, params *Orders1Params) (*
 	return &out, nil
 }
 
-// Dividends fetches a page of dividend history.
+// Dividends fetches a page of dividend history. For ergonomic full-history
+// iteration, see DividendsIter.
 //
 // GET /api/v0/equity/history/dividends (rate limit: 50 req / 1m).
 func (c *Client) Dividends(ctx context.Context, params *DividendsParams) (*PaginatedResponseHistoryDividendItem, error) {
@@ -331,7 +532,8 @@ func (c *Client) Dividends(ctx context.Context, params *DividendsParams) (*Pagin
 }
 
 // Transactions fetches a page of cash transactions (deposits, withdrawals,
-// fees, internal transfers).
+// fees, internal transfers). For ergonomic full-history iteration, see
+// TransactionsIter.
 //
 // GET /api/v0/equity/history/transactions (rate limit: 50 req / 1m).
 func (c *Client) Transactions(ctx context.Context, params *TransactionsParams) (*PaginatedResponseHistoryTransactionItem, error) {
@@ -357,7 +559,7 @@ func (c *Client) Transactions(ctx context.Context, params *TransactionsParams) (
 
 // RequestReport asynchronously kicks off generation of a CSV report covering
 // the requested data range. Use Reports to poll for completion and obtain the
-// download link.
+// download link, or WaitForReport for a one-shot helper.
 //
 // POST /api/v0/equity/history/exports (rate limit: 1 req / 30s).
 func (c *Client) RequestReport(ctx context.Context, req *PublicReportRequest) (*EnqueuedReportResponse, error) {
@@ -378,72 +580,4 @@ func (c *Client) Reports(ctx context.Context) ([]ReportResponse, error) {
 		return nil, err
 	}
 	return out, nil
-}
-
-var positionWatcherInterval = 3 * time.Second
-
-// StartPositionWatcher starts a goroutine that polls Positions on a fixed
-// interval and invokes the OnPositionOpen / OnPositionClose callbacks
-// registered on the Client when positions appear or disappear.
-// The returned channel can be used as an insurance
-// that the watcher loop has finished.
-//
-// Errors from the Positions endpoint during polling are dropped — the
-// watcher skips that tick and retries on the next one.
-//
-// Note: positions are keyed by ticker, so multiple independent trades of
-// the same symbol cannot be tracked individually. !TODO!
-func (c *Client) StartPositionWatcher(ctx context.Context) (<-chan struct{}, error) {
-	if c.onPosOpen == nil && c.onPosClose == nil {
-		return nil, ErrNilPosWatcherCallbacks
-	}
-
-	doneCh := make(chan struct{})
-
-	go func() {
-		defer close(doneCh)
-
-		ticker := time.NewTicker(positionWatcherInterval)
-		defer ticker.Stop()
-
-		known := make(map[string]Position)
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				current, err := c.Positions(ctx, nil)
-				if err != nil {
-					// handler?
-					continue
-				}
-
-				next := make(map[string]Position, len(current))
-				for _, p := range current {
-					next[*p.Instrument.Ticker] = p
-				}
-
-				if c.onPosOpen != nil {
-					for key, p := range next {
-						if _, ok := known[key]; !ok {
-							c.onPosOpen(&p)
-						}
-					}
-				}
-
-				if c.onPosClose != nil {
-					for key, old := range known {
-						if _, ok := next[key]; !ok {
-							c.onPosClose(&old)
-						}
-					}
-				}
-
-				known = next
-			}
-		}
-	}()
-
-	return doneCh, nil
 }
