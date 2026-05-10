@@ -20,5 +20,5 @@ var (
 	ErrRateLimited      = errors.New("rate limited")
 	ErrUnexpectedStatus = errors.New("unexpected status")
 
-	ErrNilPosWatcherCallbacks = errors.New("nil watcher callbacks")
+	ErrReportTimeout = errors.New("report did not finish before timeout")
 )

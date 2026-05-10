@@ -25,15 +25,15 @@ func main() {
 	}
 	defer c.Close()
 
-	summary, err := c.AccountSummary(context.Background())
-	if err != nil {
-		log.Fatalf("could not get account summary: %v", err)
-	}
+	ctx := context.Background()
 
-	fmt.Printf("account %d (%s): total value %.2f, %d positions known\n",
-		summary.GetID(),
-		summary.GetCurrency(),
-		summary.GetTotalValue(),
-		len(c.Snapshot()),
-	)
+	count := 0
+	for o, err := range c.HistoricalOrdersIter(ctx, nil) {
+		if err != nil {
+			log.Fatalf("page error after %d orders: %v", count, err)
+		}
+		count++
+		_ = o
+	}
+	fmt.Printf("walked %d historical orders\n", count)
 }

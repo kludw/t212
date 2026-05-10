@@ -1,0 +1,32 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - gocritic
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unused
+
+  exclusions:
+    rules:
+      - path: models\.gen\.go
+        linters:
+          - revive
+          - staticcheck
+          - errcheck
+          - gocritic
+          - misspell
+          - unused
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
