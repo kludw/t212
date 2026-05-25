@@ -383,12 +383,13 @@ func (e InstrumentIssueSeverity) Valid() bool {
 
 // Defines values for OrderInitiatedFrom.
 const (
-	ANDROID    OrderInitiatedFrom = "ANDROID"
-	API        OrderInitiatedFrom = "API"
-	AUTOINVEST OrderInitiatedFrom = "AUTOINVEST"
-	IOS        OrderInitiatedFrom = "IOS"
-	SYSTEM     OrderInitiatedFrom = "SYSTEM"
-	WEB        OrderInitiatedFrom = "WEB"
+	ANDROID              OrderInitiatedFrom = "ANDROID"
+	API                  OrderInitiatedFrom = "API"
+	AUTOINVEST           OrderInitiatedFrom = "AUTOINVEST"
+	INSTRUMENTAUTOINVEST OrderInitiatedFrom = "INSTRUMENT_AUTOINVEST"
+	IOS                  OrderInitiatedFrom = "IOS"
+	SYSTEM               OrderInitiatedFrom = "SYSTEM"
+	WEB                  OrderInitiatedFrom = "WEB"
 )
 
 // Valid indicates whether the value is a known member of the OrderInitiatedFrom enum.
@@ -399,6 +400,8 @@ func (e OrderInitiatedFrom) Valid() bool {
 	case API:
 		return true
 	case AUTOINVEST:
+		return true
+	case INSTRUMENTAUTOINVEST:
 		return true
 	case IOS:
 		return true
@@ -956,7 +959,7 @@ type Order struct {
 	// FilledQuantity The number of shares that have been successfully executed. Applicable to quantity orders.
 	FilledQuantity *float32 `json:"filledQuantity,omitempty"`
 
-	// FilledValue The total monetary value of the executed portion of the order. Applicable  to orders placed by value.Note: Placing orders by value is not currently supported via the API but can be done through other Trading 212 platforms.
+	// FilledValue The total monetary value of the executed portion of the order. Applicable to orders placed by value.Note: Placing orders by value is not currently supported via the API but can be done through other Trading 212 platforms.
 	FilledValue *float32 `json:"filledValue,omitempty"`
 
 	// Id A unique, system-generated identifier for the order.
